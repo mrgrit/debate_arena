@@ -1,19 +1,33 @@
-# debate_arena_popup_graph_svg_v3_stats_restore.py
+# debate_arena_v4_penalty_and_fullscreen_graph.py
 # -----------------------------------------------------------------------------
-# FIX: "out/in attack/support/counter/nudge" 패널 통계 박스(좌측 하단) 복구
+# 요청 반영 (FULL ONE-FILE)
 #
-# 이번 버전 포함 사항
-# - SVG 그래프(기본) + 클릭 시 팝업 확대
-# - 엣지 라벨 겹침 완화(충돌 회피 + 줄바꿈/축약)
-# - 패널별 상호작용 통계(out/in) UI 복구 (좌측 카드 하단)
-# - 노드 클릭 = 필터(Feed에서 해당 패널 발언만 강조/노출)
-# - 점수 공정성 보정(min_each + judge/activity 재분배) 유지
+# 1) "모호/추상/두루뭉술/하나마나한 발언" 패널티
+#    - 심판이 각 발언을 보고 vagueness(0~3) + reason + warning을 JSON으로 반환
+#    - warning이 있으면 UI에 "경고" 이벤트로 표시
+#    - 최종 점수 산정 시 패널티 반영:
+#        score = fairness_scores - (penalty_points)
+#        이후 합 100으로 재정규화
+#      (모든 패널 정상 참여 시 min_each 보장 규칙과 함께 동작)
+#
+# 2) 관계 그래프 "크게 보기"를 화면 꽉 차게(Full-screen modal)
+#    - 모달: width/height 100vw/100vh
+#    - 라벨 겹침 더 줄이기:
+#        - 큰 화면에서는 라벨 최대폭 증가
+#        - 라벨 충돌 시 더 많은 시도/더 큰 offset 탐색
+#        - 라벨을 최대 2줄 + 더 적극적 축약(ellipsis)
+#        - (옵션) edgesToDraw 라벨 표시 개수를 big에서 제한(기본 140개)
+#
+# 기타:
+# - SVG 그래프, 외부 CDN 의존 없음
+# - 패널 stats(out/in) 유지
+# - 노드 클릭=필터
 #
 # Requirements:
 #   pip install fastapi uvicorn langchain-core langchain-ollama
 #
 # Run:
-#   python3 debate_arena_popup_graph_svg_v3_stats_restore.py
+#   python3 debate_arena_v4_penalty_and_fullscreen_graph.py
 #   http://localhost:8000
 # -----------------------------------------------------------------------------
 
@@ -124,7 +138,7 @@ def validate_ollama_host(host: str) -> str:
 
 
 def http_get_json(url: str, timeout: float = 8.0) -> Dict[str, Any]:
-    req = Request(url, headers={"Accept": "application/json", "User-Agent": "DebateArena/SVG"})
+    req = Request(url, headers={"Accept": "application/json", "User-Agent": "DebateArena/v4"})
     with urlopen(req, timeout=timeout) as resp:
         data = resp.read().decode("utf-8", errors="replace")
         return json.loads(data)
@@ -188,6 +202,22 @@ JSON만 출력.
 {"summary":"...","edges":[{"from":"P1","to":"P2","type":"attack|support|counter|nudge","label":"짧게"}]}
 """.strip()
 
+# NEW: Vagueness judge / penalty warning
+VAGUENESS_JUDGE_SYSTEM = """너는 토론 심판이다. 아래 패널 발언이 '의미가 모호/추상/두루뭉술/하나마나한'지 평가하라.
+규칙:
+- 0: 매우 구체(근거/조건/예시/수치/행동 포함)
+- 1: 약간 모호(일부 구체성 부족)
+- 2: 꽤 모호(추상적 표현 많고 검증/실행이 어려움)
+- 3: 매우 모호(그럴듯한 말뿐, 내용 빈약, 실행 불가)
+
+반드시 JSON만 출력:
+{
+  "vagueness": 0|1|2|3,
+  "reason": "한 문장",
+  "warning": "vagueness>=2면 패널에게 줄 경고 문구(한 문장), 아니면 빈 문자열"
+}
+""".strip()
+
 STATE_UPDATER_SYSTEM = """너는 토론 상태 업데이트 담당이다.
 입력: 이전 상태 + 이번 라운드 발언.
 임무:
@@ -228,7 +258,7 @@ FINAL_JUDGE_SYSTEM = """너는 토론의 최종 심판이다.
 
 
 # =========================
-# Scoring fairness
+# Scoring helpers
 # =========================
 def _safe_int(x, default=0) -> int:
     try:
@@ -307,6 +337,57 @@ def normalize_scores_with_floor(
     return out
 
 
+def apply_penalties_and_renormalize(
+    base_scores: Dict[str, int],
+    penalties: Dict[str, int],
+    panel_ids: List[str],
+    min_each: int,
+) -> Dict[str, int]:
+    """
+    base_scores sums to 100 (after fairness).
+    penalties are non-negative point deductions.
+    Steps:
+      1) deduct: s' = max(0, s - p)
+      2) if all participated (we assume here: if base_scores already used floor), try to keep min_each,
+         but penalty can pull below min_each; we allow it (penalty is "punishment").
+      3) renormalize to sum=100 by distributing difference proportionally to remaining scores.
+         If all become 0, split equally.
+    """
+    s2 = {}
+    for pid in panel_ids:
+        s2[pid] = max(0, int(base_scores.get(pid, 0)) - int(penalties.get(pid, 0)))
+
+    total = sum(s2.values())
+    if total == 100:
+        return s2
+
+    if total <= 0:
+        eq = 100 // len(panel_ids)
+        rem = 100 - eq * len(panel_ids)
+        out = {pid: eq for pid in panel_ids}
+        for pid in panel_ids[:rem]:
+            out[pid] += 1
+        return out
+
+    # scale to 100
+    scaled = {pid: int(round(s2[pid] * 100 / total)) for pid in panel_ids}
+    diff = 100 - sum(scaled.values())
+    # distribute diff to highest residuals (use s2 as weight)
+    order = sorted(panel_ids, key=lambda p: s2[p], reverse=True)
+    i = 0
+    while diff != 0:
+        pid = order[i % len(order)]
+        if diff > 0:
+            scaled[pid] += 1
+            diff -= 1
+        else:
+            if scaled[pid] > 0:
+                scaled[pid] -= 1
+                diff += 1
+        i += 1
+    return scaled
+
+
 # =========================
 # WebSocket Hub
 # =========================
@@ -357,6 +438,12 @@ class SessionConfig:
     summary_max_chars: int = 2000
     recent_window_rounds: int = 2
     min_score_each: int = 5
+    # penalty tuning
+    vagueness_penalty_map: Dict[int, int] = None  # e.g., {2:2, 3:4}
+
+    def __post_init__(self):
+        if self.vagueness_penalty_map is None:
+            self.vagueness_penalty_map = {2: 2, 3: 4}
 
 
 SESSION_CFG: Dict[str, SessionConfig] = {}
@@ -374,6 +461,8 @@ def init_state(question: str, panel_ids: List[str]) -> Dict[str, Any]:
         "last_roles": {},
         "edges": [],
         "activity": {pid: {"utterances": 0, "chars": 0, "edges": 0} for pid in panel_ids},
+        # NEW: vagueness tracking
+        "vagueness": {pid: {"count2": 0, "count3": 0, "penalty": 0, "last": 0} for pid in panel_ids},
     }
 
 
@@ -445,6 +534,7 @@ PHASE 목표: {meta['goal']}
 공통 규칙:
 - 최근 window의 다른 패널 발언을 읽고: 공감/반박/저격/틈새 지적을 수행
 - 과도한 편향/단정 금지: 인정할 점은 인정 + 개선안 제시
+- ⚠️ 모호/추상/두루뭉술/하나마나한 발언은 심판이 감점 경고 및 실제 감점을 한다.
 """.strip()
 
 
@@ -474,6 +564,10 @@ def build_panel_prompt(panel_id: str, role: str, state: Dict[str, Any], announce
 {role}
 역할 가이드: {ROLE_GUIDE.get(role, ROLE_GUIDE["balanced"])}
 
+[중요: 구체성 규칙]
+- 추상적 수사 대신: 조건/범위/예시/절차/검증 방법/트레이드오프를 포함하라.
+- "필요하다/중요하다/해야 한다"만 반복하면 감점된다.
+
 {build_phase_task(phase)}
 """.strip()
 
@@ -488,7 +582,6 @@ async def assign_roles(cfg: SessionConfig, state: Dict[str, Any], round_no: int,
         "phase_ratios": cfg.phase_ratios,
         "panel_ids": panel_ids,
         "running_summary": clamp_text(state["running_summary"], 1200),
-        "open_issues": [i for i in state["issue_board"] if i.get("status") == "open"],
         "recent_window": state["recent_window"],
         "last_roles": state.get("last_roles", {}),
     }
@@ -538,10 +631,25 @@ async def utterance_mini_summary(cfg: SessionConfig, state: Dict[str, Any], pane
         frm = str(e.get("from", panel_id)).strip()
         to = str(e.get("to", "")).strip()
         typ = str(e.get("type", "nudge")).strip()
-        lab = str(e.get("label", "")).strip()[:80]
+        lab = str(e.get("label", "")).strip()[:120]
         if frm and to and frm != to:
             fixed_edges.append({"from": frm, "to": to, "type": typ, "label": lab})
     return {"summary": str(obj.get("summary", "")).strip(), "edges": fixed_edges}
+
+
+async def vagueness_judge(cfg: SessionConfig, panel_id: str, utterance: str) -> Dict[str, Any]:
+    judge = get_ollama_chat(cfg.judge_model, cfg.host, temperature=0.2)
+    payload = {"panel_id": panel_id, "utterance": clamp_text(utterance, 1600)}
+    obj = await force_json_only(
+        judge,
+        [SystemMessage(content=VAGUENESS_JUDGE_SYSTEM), HumanMessage(content=json.dumps(payload, ensure_ascii=False))],
+        max_repair=3,
+    )
+    vag = int(obj.get("vagueness", 0)) if str(obj.get("vagueness", "0")).isdigit() else 0
+    vag = max(0, min(3, vag))
+    reason = str(obj.get("reason", "")).strip()
+    warning = str(obj.get("warning", "")).strip()
+    return {"vagueness": vag, "reason": reason, "warning": warning}
 
 
 async def update_state_round(cfg: SessionConfig, state: Dict[str, Any], round_no: int, phase: int, announcement: str, roles: Dict[str, str], round_outputs: Dict[str, str]):
@@ -609,6 +717,7 @@ async def final_judge(cfg: SessionConfig, state: Dict[str, Any], panel_ids: List
         "panel_ids": panel_ids,
         "activity": state.get("activity", {}),
         "min_score_each": cfg.min_score_each,
+        "vagueness": state.get("vagueness", {}),
     }
     out = await force_json_only(
         judge,
@@ -618,7 +727,19 @@ async def final_judge(cfg: SessionConfig, state: Dict[str, Any], panel_ids: List
 
     judge_scores = out.get("scores", {}) if isinstance(out.get("scores", {}), dict) else {}
     activity = state.get("activity", {}) if isinstance(state.get("activity", {}), dict) else {}
-    out["scores"] = normalize_scores_with_floor(judge_scores, panel_ids, activity, min_each=cfg.min_score_each)
+    base = normalize_scores_with_floor(judge_scores, panel_ids, activity, min_each=cfg.min_score_each)
+
+    # Apply penalties based on vagueness
+    penalties = {}
+    for pid in panel_ids:
+        v = state["vagueness"].get(pid, {})
+        penalties[pid] = int(v.get("penalty", 0))
+
+    final_scores = apply_penalties_and_renormalize(base, penalties, panel_ids, cfg.min_score_each)
+
+    out["scores_before_penalty"] = base
+    out["penalties"] = penalties
+    out["scores"] = final_scores
 
     rationale = out.get("score_rationale", {})
     if not isinstance(rationale, dict):
@@ -626,7 +747,11 @@ async def final_judge(cfg: SessionConfig, state: Dict[str, Any], panel_ids: List
     for pid in panel_ids:
         if not str(rationale.get(pid, "")).strip():
             a = activity.get(pid, {})
-            rationale[pid] = f"발언 {int(a.get('utterances',0))}회, 상호작용 {int(a.get('edges',0))}회 기여 반영."
+            pv = state["vagueness"].get(pid, {})
+            rationale[pid] = (
+                f"발언 {int(a.get('utterances',0))}회, 상호작용 {int(a.get('edges',0))}회."
+                f" 모호발언 패널티 {int(pv.get('penalty',0))}점 반영."
+            )
     out["score_rationale"] = rationale
     return out
 
@@ -659,6 +784,11 @@ async def debate_stream(session_id: str, question: str):
                 "total_rounds": cfg.total_rounds,
                 "phase_ratios": ratios,
                 "phase_meta": PHASE_META,
+                "penalty_rule": {
+                    "vagueness_scale": "0..3",
+                    "penalty_map": cfg.vagueness_penalty_map,
+                    "note": "vagueness>=2이면 경고 + 감점 누적",
+                }
             },
         )
 
@@ -704,6 +834,30 @@ async def debate_stream(session_id: str, question: str):
                     {"type": "utterance", "round": r, "phase": phase, "panel_id": pid, "role": role, "text": utter},
                 )
 
+                # NEW: vagueness evaluation + warning + penalty
+                vag = await vagueness_judge(cfg, pid, utter)
+                state["vagueness"][pid]["last"] = vag["vagueness"]
+                if vag["vagueness"] == 2:
+                    state["vagueness"][pid]["count2"] += 1
+                    state["vagueness"][pid]["penalty"] += cfg.vagueness_penalty_map.get(2, 2)
+                elif vag["vagueness"] == 3:
+                    state["vagueness"][pid]["count3"] += 1
+                    state["vagueness"][pid]["penalty"] += cfg.vagueness_penalty_map.get(3, 4)
+
+                if vag["warning"]:
+                    await hub.broadcast(
+                        session_id,
+                        {
+                            "type": "judge_warning",
+                            "round": r,
+                            "panel_id": pid,
+                            "vagueness": vag["vagueness"],
+                            "reason": vag["reason"],
+                            "warning": vag["warning"],
+                            "penalty_total": state["vagueness"][pid]["penalty"],
+                        },
+                    )
+
                 mini = await utterance_mini_summary(cfg, state, pid, role, utter, panel_ids)
                 if mini["summary"]:
                     await hub.broadcast(
@@ -733,11 +887,21 @@ async def debate_stream(session_id: str, question: str):
                     "open_issues": [i for i in state["issue_board"] if i.get("status") == "open"],
                     "agreements": state["agreements"],
                     "unresolved": state["unresolved"],
+                    "vagueness": state["vagueness"],
                 },
             )
 
         final = await final_judge(cfg, state, panel_ids)
-        await hub.broadcast(session_id, {"type": "final", "final": final, "running_summary": state["running_summary"], "edges": state["edges"]})
+        await hub.broadcast(
+            session_id,
+            {
+                "type": "final",
+                "final": final,
+                "running_summary": state["running_summary"],
+                "edges": state["edges"],
+                "vagueness": state["vagueness"],
+            },
+        )
 
     except Exception as e:
         await hub.broadcast(session_id, {"type": "error", "message": f"{type(e).__name__}: {e}"})
@@ -845,7 +1009,7 @@ async def ws(session_id: str, websocket: WebSocket):
 
 
 # =========================
-# Frontend (SVG label collision fix + stats restored)
+# Frontend (full-screen modal + better overlap avoidance + warnings + stats)
 # =========================
 INDEX_HTML = r"""
 <!doctype html>
@@ -853,11 +1017,12 @@ INDEX_HTML = r"""
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Debate Arena (SVG Graph Popup + Stats)</title>
+  <title>Debate Arena v4</title>
   <style>
     :root{
       --bg:#0b1020; --text:#e9eefc; --muted:#9fb0df; --border:rgba(255,255,255,.08);
       --attack:#ff5c8a; --support:#3ee6a8; --counter:#ffc857; --nudge:#7aa2ff;
+      --warn:#ffc857; --bad:#ff5c8a;
     }
     *{box-sizing:border-box}
     body{margin:0;color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,"Apple SD Gothic Neo";
@@ -882,6 +1047,9 @@ INDEX_HTML = r"""
     .msg .meta{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:6px}
     .badge{padding:2px 8px;border-radius:999px;border:1px solid var(--border);font-size:11px}
     .badge.filter{border-color:rgba(255,255,255,.18);color:#dce5ff}
+    .badge.warn{border-color:rgba(255,200,87,.35);color:#ffe0a1}
+    .badge.pen{border-color:rgba(255,92,138,.35);color:#ffb0c4}
+
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     .summaryBox{background:linear-gradient(180deg,rgba(62,230,168,.10),rgba(255,255,255,.02));
       border:1px solid rgba(62,230,168,.22);border-radius:14px;padding:10px 12px}
@@ -903,7 +1071,7 @@ INDEX_HTML = r"""
       padding:6px 8px; border-radius:10px;
     }
 
-    /* Stats (restored) */
+    /* Stats */
     .panelStats{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
     .stat{
       border:1px solid var(--border);
@@ -916,24 +1084,21 @@ INDEX_HTML = r"""
     .stat .id{font-weight:900;margin-bottom:6px}
     .stat .line{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:10px}
     .stat .line span:last-child{color:#e9eefc}
+    .stat .penLine{margin-top:6px;font-size:12px;color:#ffb0c4;display:flex;justify-content:space-between}
 
-    /* Modal */
+    /* Fullscreen Modal */
     .modalBack{
       display:none;
       position:fixed; inset:0;
-      background:rgba(0,0,0,.55);
-      z-index:999;
-      align-items:center;
-      justify-content:center;
-      padding:16px;
+      background:rgba(0,0,0,.65);
+      z-index:9999;
+      align-items:stretch;
+      justify-content:stretch;
     }
     .modal{
-      width:min(1100px, 96vw);
-      height:min(760px, 92vh);
-      background:rgba(11,16,32,.92);
-      border:1px solid var(--border);
-      border-radius:18px;
-      box-shadow:0 18px 80px rgba(0,0,0,.55);
+      width:100vw;
+      height:100vh;
+      background:rgba(11,16,32,.94);
       display:flex;
       flex-direction:column;
       overflow:hidden;
@@ -944,6 +1109,8 @@ INDEX_HTML = r"""
       justify-content:space-between;
       align-items:center;
       border-bottom:1px solid var(--border);
+      background:rgba(11,16,32,.75);
+      backdrop-filter:blur(10px);
     }
     .modalBody{flex:1; padding:10px 12px;}
     .graphWrapBig{
@@ -951,7 +1118,7 @@ INDEX_HTML = r"""
       height:100%;
       border-radius:14px;
       border:1px solid var(--border);
-      background:radial-gradient(1100px 600px at 20% 0%, rgba(122,162,255,.18), rgba(0,0,0,0));
+      background:radial-gradient(1400px 800px at 20% 0%, rgba(122,162,255,.18), rgba(0,0,0,0));
       overflow:hidden;
     }
 
@@ -1029,14 +1196,13 @@ INDEX_HTML = r"""
     <div class="card">
       <div class="row" style="justify-content:space-between;">
         <div class="h">관계 그래프</div>
-        <div class="tiny muted">click → popup</div>
+        <div class="tiny muted">click → fullscreen</div>
       </div>
       <div class="graphWrap" id="graphSmall">
         <div class="graphHint">클릭해서 크게 보기</div>
         <div id="svgSmallHolder" style="width:100%;height:100%;"></div>
       </div>
 
-      <!-- ✅ RESTORED: Panel Stats (left-bottom area) -->
       <div class="panelStats" id="panelStats"></div>
 
       <div class="summaryBox" style="margin-top:12px;">
@@ -1056,11 +1222,11 @@ INDEX_HTML = r"""
   </div>
 </div>
 
-<!-- Modal -->
+<!-- Fullscreen Modal -->
 <div class="modalBack" id="modalBack">
   <div class="modal">
     <div class="modalHeader">
-      <div class="h">관계 그래프 (확대)</div>
+      <div class="h">관계 그래프 (전체 화면)</div>
       <div class="row">
         <div class="tiny muted" style="margin-right:8px;">ESC 또는 닫기</div>
         <button id="closeModalBtn" style="padding:6px 10px;">닫기</button>
@@ -1079,6 +1245,7 @@ let sessionId=null, ws=null;
 let filterPanel=null;
 let panelIds=[];
 let loadedModels=[];
+let penaltyMap={2:2,3:4};
 
 const statusEl=document.getElementById("status");
 const roundEl=document.getElementById("roundInfo");
@@ -1094,7 +1261,6 @@ const panelCountSel=document.getElementById("panelCount");
 const panelSelectors=document.getElementById("panelSelectors");
 
 const panelStatsEl=document.getElementById("panelStats");
-
 const smallHolder=document.getElementById("svgSmallHolder");
 const bigHolder=document.getElementById("svgBigHolder");
 
@@ -1116,26 +1282,31 @@ function updateFilterUI(){
   });
 }
 
-function addMsg({title, metaLeft, metaRight, body, panelId}){
+function addMsg({title, metaLeft, metaRight, body, panelId, badgeHtml}){
   if(filterPanel && panelId && panelId!==filterPanel) return;
   const div=document.createElement("div");
   div.className="msg";
   div.dataset.panelId=panelId||"";
   div.innerHTML=`
     <div class="meta"><div>${escapeHtml(metaLeft||"")}</div><div>${escapeHtml(metaRight||"")}</div></div>
-    <div class="h">${escapeHtml(title||"")}</div>
+    <div class="h">${escapeHtml(title||"")} ${badgeHtml||""}</div>
     <div style="margin-top:8px; white-space:pre-wrap; line-height:1.45;">${escapeHtml(body||"")}</div>`;
   feedEl.prepend(div);
 }
 
-/* ---------------- Stats (RESTORED) ---------------- */
-const interactionCounts = {}; // pid -> {out:{},in:{}}
+/* ---------------- Stats ---------------- */
+const interactionCounts = {};
+const vagInfo = {}; // pid -> {count2,count3,penalty,last}
+
 function ensureCounts(pid){
   if(!interactionCounts[pid]){
     interactionCounts[pid]={
       out:{attack:0,support:0,counter:0,nudge:0},
       in:{attack:0,support:0,counter:0,nudge:0}
     };
+  }
+  if(!vagInfo[pid]){
+    vagInfo[pid]={count2:0,count3:0,penalty:0,last:0};
   }
 }
 function renderStats(){
@@ -1147,6 +1318,7 @@ function renderStats(){
   panelIds.forEach(pid=>{
     ensureCounts(pid);
     const c = interactionCounts[pid];
+    const v = vagInfo[pid] || {count2:0,count3:0,penalty:0,last:0};
     const d=document.createElement("div");
     d.className="stat";
     d.innerHTML = `
@@ -1159,14 +1331,16 @@ function renderStats(){
       <div class="line"><span class="muted">in support</span><span>${c.in.support}</span></div>
       <div class="line"><span class="muted">in counter</span><span>${c.in.counter}</span></div>
       <div class="line"><span class="muted">in nudge</span><span>${c.in.nudge}</span></div>
+      <div class="penLine"><span>vag(2/3)</span><span>${v.count2}/${v.count3}</span></div>
+      <div class="penLine"><span>penalty</span><span>${v.penalty}</span></div>
     `;
     panelStatsEl.appendChild(d);
   });
 }
 
 /* ---------------- SVG Graph ---------------- */
-let graphNodes=[]; // [{id}]
-let graphEdges=[]; // [{from,to,type,label}]
+let graphNodes=[];
+let graphEdges=[];
 
 function colorByType(t){
   const css=getComputedStyle(document.documentElement);
@@ -1179,6 +1353,12 @@ function colorByType(t){
 function wrapText(str, maxChars){
   const s=(str||"").trim();
   if(!s) return [];
+  const hasSpace = /\s/.test(s);
+  if(!hasSpace){
+    const lines=[];
+    for(let i=0;i<s.length;i+=maxChars) lines.push(s.slice(i,i+maxChars));
+    return lines;
+  }
   const words=s.split(/\s+/);
   const lines=[];
   let cur="";
@@ -1192,17 +1372,13 @@ function wrapText(str, maxChars){
     }
   }
   if(cur) lines.push(cur);
-  if(lines.length===0){
-    for(let i=0;i<s.length;i+=maxChars) lines.push(s.slice(i,i+maxChars));
-  }
   return lines;
 }
-
 function rectsOverlap(a,b){
   return !(a.x+a.w < b.x || b.x+b.w < a.x || a.y+a.h < b.y || b.y+b.h < a.y);
 }
 
-function renderGraph(holder, width, height){
+function renderGraph(holder, width, height, isBig){
   holder.innerHTML="";
   const svgNS="http://www.w3.org/2000/svg";
   const svg=document.createElementNS(svgNS,"svg");
@@ -1214,7 +1390,7 @@ function renderGraph(holder, width, height){
   const defs=document.createElementNS(svgNS,"defs");
   ["attack","support","counter","nudge"].forEach(t=>{
     const m=document.createElementNS(svgNS,"marker");
-    m.setAttribute("id","arrow_"+t);
+    m.setAttribute("id", (isBig?"B_":"S_") + "arrow_"+t);
     m.setAttribute("markerWidth","10");
     m.setAttribute("markerHeight","10");
     m.setAttribute("refX","9");
@@ -1230,15 +1406,16 @@ function renderGraph(holder, width, height){
 
   const n=graphNodes.length || 1;
   const cx=width/2, cy=height/2;
-  const R=Math.min(width,height)*0.34;
+  const R=Math.min(width,height)*(isBig?0.40:0.34);
   const nodePos={};
   graphNodes.forEach((node, i)=>{
     const ang = (Math.PI*2*i)/n - Math.PI/2;
     nodePos[node.id]={x: cx + R*Math.cos(ang), y: cy + R*Math.sin(ang)};
   });
 
-  const edgesToDraw = graphEdges.slice(-120);
-
+  // draw edges
+  const maxEdges = isBig ? 260 : 140;
+  const edgesToDraw = graphEdges.slice(-maxEdges);
   edgesToDraw.forEach((e)=>{
     const a=nodePos[e.from], b=nodePos[e.to];
     if(!a || !b) return;
@@ -1249,44 +1426,49 @@ function renderGraph(holder, width, height){
     line.setAttribute("y2", b.y);
     const col=colorByType(e.type);
     line.setAttribute("stroke", col);
-    line.setAttribute("stroke-width", "2.2");
-    line.setAttribute("marker-end", `url(#arrow_${e.type||"nudge"})`);
+    line.setAttribute("stroke-width", isBig ? "2.4" : "2.2");
+    line.setAttribute("marker-end", `url(#${(isBig?"B_":"S_")}arrow_${e.type||"nudge"})`);
     line.setAttribute("opacity","0.95");
     svg.appendChild(line);
   });
 
+  // label placement: stronger in big
   const placedBboxes=[];
-  const labelMaxWidth = Math.min(220, Math.floor(width*0.30));
-  const approxCharW = 7;
+  const labelMaxWidth = isBig ? Math.min(360, Math.floor(width*0.28)) : Math.min(220, Math.floor(width*0.30));
+  const approxCharW = isBig ? 7.2 : 7.0;
   const paddingX = 10, paddingY = 8;
-  const lineH = 14;
+  const lineH = isBig ? 15 : 14;
 
   function placeLabel(e){
     const a=nodePos[e.from], b=nodePos[e.to];
     if(!a || !b) return;
-
     let label=(e.label||"").trim();
     if(!label) return;
 
+    // big에서는 더 공격적으로 줄 수 줄이기(2줄)
     const maxChars = Math.max(10, Math.floor((labelMaxWidth - paddingX*2)/approxCharW));
     let lines = wrapText(label, maxChars);
-    if(lines.length>3){
-      lines = lines.slice(0,2).concat([(lines[2].slice(0, Math.max(3, maxChars-1)) + "…")]);
+
+    const maxLines = isBig ? 2 : 3;
+    if(lines.length>maxLines){
+      const cut = lines.slice(0, maxLines);
+      cut[maxLines-1] = cut[maxLines-1].slice(0, Math.max(6, maxChars-2)) + "…";
+      lines = cut;
     }
 
-    const textW = Math.min(labelMaxWidth, Math.max(60, Math.max(...lines.map(l=>l.length))*approxCharW + paddingX*2));
+    const textW = Math.min(labelMaxWidth, Math.max(70, Math.max(...lines.map(l=>l.length))*approxCharW + paddingX*2));
     const textH = lines.length*lineH + paddingY*2;
 
     const mx=(a.x+b.x)/2, my=(a.y+b.y)/2;
     const dx=b.x-a.x, dy=b.y-a.y;
     const len=Math.max(1, Math.hypot(dx,dy));
     const nx=-dy/len, ny=dx/len;
-    const baseOffset = 18;
 
-    const attempts = 10;
-    const step = 18;
+    const baseOffset = isBig ? 28 : 18;
+    const attempts = isBig ? 18 : 10;
+    const step = isBig ? 22 : 18;
+
     let best = null;
-
     for(let k=0;k<attempts;k++){
       const s = (k%2===0) ? 1 : -1;
       const mag = baseOffset + step*Math.floor(k/2);
@@ -1295,9 +1477,9 @@ function renderGraph(holder, width, height){
 
       const x = mx + ox - textW/2;
       const y = my + oy - textH/2;
-
       const bbox = {x,y,w:textW,h:textH};
-      if(bbox.x < 4 || bbox.y < 4 || bbox.x+bbox.w > width-4 || bbox.y+bbox.h > height-4){
+
+      if(bbox.x < 6 || bbox.y < 6 || bbox.x+bbox.w > width-6 || bbox.y+bbox.h > height-6){
         continue;
       }
 
@@ -1308,15 +1490,15 @@ function renderGraph(holder, width, height){
       if(!coll){ best=bbox; break; }
       if(!best) best=bbox;
     }
-
     if(!best) return;
 
+    // heavy overlap -> stronger ellipsis
     let heavy=false;
     for(const pb of placedBboxes){
       if(rectsOverlap(best, pb)){ heavy=true; break; }
     }
     if(heavy){
-      const short = label.slice(0, Math.max(8, Math.floor(maxChars*0.7))) + "…";
+      const short = label.slice(0, Math.max(10, Math.floor(maxChars*0.55))) + "…";
       lines = [short];
     }
 
@@ -1346,7 +1528,7 @@ function renderGraph(holder, width, height){
       const t=document.createElementNS(svgNS,"text");
       t.setAttribute("x", best.x + 18);
       t.setAttribute("y", best.y + paddingY + lineH*(i+1) - 4);
-      t.setAttribute("font-size","12");
+      t.setAttribute("font-size", isBig ? "13" : "12");
       t.setAttribute("fill","#cbd6ff");
       t.textContent = lines[i];
       g.appendChild(t);
@@ -1356,8 +1538,10 @@ function renderGraph(holder, width, height){
     placedBboxes.push(best);
   }
 
+  // place labels after edges
   edgesToDraw.forEach(placeLabel);
 
+  // nodes on top
   graphNodes.forEach((node)=>{
     const p=nodePos[node.id];
     if(!p) return;
@@ -1367,8 +1551,8 @@ function renderGraph(holder, width, height){
     const circle=document.createElementNS(svgNS,"circle");
     circle.setAttribute("cx", p.x);
     circle.setAttribute("cy", p.y);
-    circle.setAttribute("r", 22);
-    circle.setAttribute("fill", (filterPanel===node.id) ? "rgba(122,162,255,0.9)" : "rgba(122,162,255,0.65)");
+    circle.setAttribute("r", isBig ? 26 : 22);
+    circle.setAttribute("fill", (filterPanel===node.id) ? "rgba(122,162,255,0.92)" : "rgba(122,162,255,0.65)");
     circle.setAttribute("stroke","rgba(255,255,255,0.12)");
     circle.setAttribute("stroke-width","2");
 
@@ -1376,7 +1560,7 @@ function renderGraph(holder, width, height){
     text.setAttribute("x", p.x);
     text.setAttribute("y", p.y+5);
     text.setAttribute("text-anchor","middle");
-    text.setAttribute("font-size","12");
+    text.setAttribute("font-size", isBig ? "14" : "12");
     text.setAttribute("fill","#e9eefc");
     text.textContent=node.id;
 
@@ -1398,29 +1582,25 @@ function renderGraph(holder, width, height){
 
 function redrawGraphs(){
   const sRect = document.getElementById("graphSmall").getBoundingClientRect();
-  const wS = Math.max(220, Math.floor(sRect.width));
-  const hS = Math.max(220, Math.floor(sRect.height));
-  renderGraph(smallHolder, wS, hS);
+  renderGraph(smallHolder, Math.max(220, Math.floor(sRect.width)), Math.max(220, Math.floor(sRect.height)), false);
 
   if(modalBack.style.display==="flex"){
     const bRect = document.getElementById("graphBig").getBoundingClientRect();
-    const wB = Math.max(600, Math.floor(bRect.width));
-    const hB = Math.max(420, Math.floor(bRect.height));
-    renderGraph(bigHolder, wB, hB);
+    renderGraph(bigHolder, Math.max(800, Math.floor(bRect.width)), Math.max(600, Math.floor(bRect.height)), true);
   }
 }
 
 /* modal */
 function openModal(){
   modalBack.style.display="flex";
-  setTimeout(()=>redrawGraphs(), 30);
+  setTimeout(()=>redrawGraphs(), 50);
 }
 function closeModal(){ modalBack.style.display="none"; }
 document.getElementById("graphSmall").addEventListener("click", openModal);
 closeModalBtn.addEventListener("click", closeModal);
 modalBack.addEventListener("click",(e)=>{ if(e.target===modalBack) closeModal(); });
 window.addEventListener("keydown",(e)=>{ if(e.key==="Escape") closeModal(); });
-window.addEventListener("resize", ()=> setTimeout(redrawGraphs, 80));
+window.addEventListener("resize", ()=> setTimeout(redrawGraphs, 100));
 
 /* config */
 function fillSelect(sel, items){
@@ -1505,10 +1685,10 @@ async function start(){
   roundEl.textContent="Round -";
   phaseEl.textContent="Phase -";
 
-  // reset graph + stats
   graphNodes=[]; graphEdges=[]; panelIds=[];
   filterPanel=null; updateFilterUI();
   for(const k of Object.keys(interactionCounts)) delete interactionCounts[k];
+  for(const k of Object.keys(vagInfo)) delete vagInfo[k];
   renderStats();
   redrawGraphs();
 
@@ -1581,8 +1761,8 @@ function handle(msg){
     panelIds=(msg.panels||[]).map(p=>p.id);
     graphNodes = panelIds.map(id=>({id}));
     graphEdges = [];
+    penaltyMap = (msg.penalty_rule && msg.penalty_rule.penalty_map) ? msg.penalty_rule.penalty_map : penaltyMap;
 
-    // init stats
     panelIds.forEach(pid=>ensureCounts(pid));
     renderStats();
     redrawGraphs();
@@ -1591,7 +1771,7 @@ function handle(msg){
       title:"Session Init",
       metaLeft:`host ${msg.host}`,
       metaRight:`judge ${msg.judge_model}`,
-      body:`Q: ${msg.question}\\nPanels:\\n${(msg.panels||[]).map(p=>`${p.id} = ${p.model}`).join("\\n")}`
+      body:`Q: ${msg.question}\\nPanels:\\n${(msg.panels||[]).map(p=>`${p.id} = ${p.model}`).join("\\n")}\\n\\nPenalty: vagueness>=2 → ${JSON.stringify(penaltyMap)}`
     });
     return;
   }
@@ -1608,6 +1788,25 @@ function handle(msg){
     return;
   }
 
+  if(msg.type==="judge_warning"){
+    const pid = msg.panel_id;
+    ensureCounts(pid);
+    vagInfo[pid].last = msg.vagueness || 0;
+    vagInfo[pid].penalty = msg.penalty_total || vagInfo[pid].penalty;
+    // counts are tracked on server, but we reflect quickly:
+    // can't infer count2/count3 reliably from one event; still show penalty total + last.
+    renderStats();
+    addMsg({
+      title:`⚠️ Judge Warning → ${pid}`,
+      metaLeft:`R${msg.round} vag=${msg.vagueness}`,
+      metaRight:`penalty total ${msg.penalty_total}`,
+      body:`${msg.warning}\\nReason: ${msg.reason}`,
+      panelId: pid,
+      badgeHtml:`<span class="badge warn">warn</span> <span class="badge pen">penalty</span>`
+    });
+    return;
+  }
+
   if(msg.type==="judge_mini"){
     judgeMini.textContent = msg.summary || "";
     judgeMiniMeta.textContent = `R${msg.round} · after ${msg.panel_id}`;
@@ -1620,7 +1819,6 @@ function handle(msg){
       if(!graphNodes.find(n=>n.id===e.to)) graphNodes.push({id:e.to});
       graphEdges.push(e);
 
-      // ✅ update stats
       const t = (e.type || "nudge");
       ensureCounts(e.from); ensureCounts(e.to);
       if(interactionCounts[e.from].out[t] !== undefined) interactionCounts[e.from].out[t] += 1;
@@ -1631,8 +1829,27 @@ function handle(msg){
     return;
   }
 
+  if(msg.type==="round_end"){
+    // vagueness snapshot
+    if(msg.vagueness){
+      for(const pid of Object.keys(msg.vagueness)){
+        ensureCounts(pid);
+        vagInfo[pid] = {...vagInfo[pid], ...msg.vagueness[pid]};
+      }
+      renderStats();
+    }
+    return;
+  }
+
   if(msg.type==="final"){
     statusEl.textContent="done";
+    if(msg.vagueness){
+      for(const pid of Object.keys(msg.vagueness)){
+        ensureCounts(pid);
+        vagInfo[pid] = {...vagInfo[pid], ...msg.vagueness[pid]};
+      }
+      renderStats();
+    }
     addMsg({title:"FINAL", metaLeft:"judge", body:JSON.stringify(msg.final,null,2)});
     return;
   }
